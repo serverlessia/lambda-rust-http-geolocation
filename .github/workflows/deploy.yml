@@ -1,0 +1,185 @@
+name: Build and Deploy Rust Lambda
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+# Cancel in-progress jobs when new commits are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FUNCTION_NAME: lambda_http_geolocation
+  RUNTIME: provided.al2023
+  ARCHITECTURE: arm64
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  validate:
+    name: Validate and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-unknown-linux-gnu
+          override: true
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.zig
+            zig-linux-x86_64-0.13.0
+          key: ${{ runner.os }}-zig-0.13.0
+
+      - name: Install Zig
+        run: |
+          if [ ! -d "zig-linux-x86_64-0.13.0" ]; then
+            curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          fi
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-lambda
+        run: |
+          if ! command -v cargo-lambda &> /dev/null; then
+            cargo install cargo-lambda
+          else
+            echo "✅ cargo-lambda already installed"
+          fi
+
+      - name: Run clippy
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: |
+          cargo test
+
+      - name: Build Lambda function
+        run: |
+          cargo lambda build --release --arm64
+
+      - name: Verify binary
+        run: |
+          if [ ! -f "target/lambda/lambda_http_geolocation/bootstrap" ]; then
+            echo "❌ Binary not found at target/lambda/lambda_http_geolocation/bootstrap"
+            exit 1
+          fi
+          echo "✅ Binary created successfully"
+          ls -la target/lambda/lambda_http_geolocation/bootstrap
+          file target/lambda/lambda_http_geolocation/bootstrap
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-unknown-linux-gnu
+          override: true
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.zig
+            zig-linux-x86_64-0.13.0
+          key: ${{ runner.os }}-zig-0.13.0
+
+      - name: Install Zig
+        run: |
+          if [ ! -d "zig-linux-x86_64-0.13.0" ]; then
+            curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          fi
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install cargo-lambda
+        run: |
+          if ! command -v cargo-lambda &> /dev/null; then
+            cargo install cargo-lambda
+          else
+            echo "✅ cargo-lambda already installed"
+          fi
+
+      - name: Build Lambda function
+        run: |
+          cargo lambda build --release --arm64
+
+      - name: Create deployment package
+        run: |
+          cd target/lambda/lambda_http_geolocation
+          zip -r lambda_http_geolocation.zip bootstrap
+          cd ../../..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: target/lambda/lambda_http_geolocation/lambda_http_geolocation.zip
+          tag_name: v${{ github.run_number }}
+          name: Release v${{ github.run_number }}
+          body: |
+            ## Rust Lambda Function Release
+
+            **Function:** ${{ env.FUNCTION_NAME }}
+            **Runtime:** ${{ env.RUNTIME }}
+            **Architecture:** ${{ env.ARCHITECTURE }}
+
+            ### Installation
+            1. Download the `lambda_http_geolocation.zip` file
+            2. Upload to AWS Lambda console or use AWS CLI
+            3. Set handler to: `bootstrap`
+            4. Set runtime to: `provided.al2023`
+            5. Set architecture to: `arm64`
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag Latest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push origin latest --force
